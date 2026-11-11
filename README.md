@@ -1,7 +1,7 @@
 # Ledger
 
 **A crash-fault-tolerant distributed payment ledger, built on Raft consensus.**
-Go · Raft (from scratch) · Ed25519 signatures · Protobuf over TCP · 5-node cluster
+C++20 · Raft (from scratch) · Ed25519 signatures (libsodium) · Protobuf over TCP (epoll) · 5-node cluster
 
 > **Status: in progress.** This README describes the design. Sections marked *(planned)* will be filled in as each part is built and tested.
 
@@ -24,44 +24,46 @@ Ledger runs on 5 nodes and keeps working when up to 2 of them crash.
 | Consensus | Leader election, log replication, Figure 8-safe commit rule, pre-vote, ReadIndex linearizable reads, fast log backtracking |
 | Ledger | Signed `CREATE_ACCOUNT` / `TRANSFER`, canonical signing bytes, nonces, genesis faucet, constant total supply |
 | Storage | Segmented WAL with CRC32C, group-commit fsync, atomic metadata, snapshots, log compaction, InstallSnapshot |
-| Networking | Length-prefixed protobuf over TCP, reconnect with backoff, bounded per-peer queues, simulated partitions |
-| Testing | Deterministic Raft simulator (thousands of seeds), fuzzing, race detector, Jepsen-style checker, chaos testing |
+| Networking | Single-threaded epoll event loop, length-prefixed protobuf over TCP, reconnect with backoff, bounded per-peer buffers, simulated partitions and slow/lossy links |
+| Testing | Deterministic Raft simulator (thousands of seeds), sanitizers, fuzzing, Jepsen-style checker, chaos testing |
 
 ## Architecture
 
 ```
-ledger-cli ──▶ client handlers ──┐
-                                 ▼
-peers ◀──▶ transport ◀──▶  NODE LOOP (one goroutine)  ◀── 10ms ticker
+ledger-cli ──▶ client connections ──┐
+                                    ▼
+peers ◀──▶ transport ◀──▶  EVENT LOOP (one thread, epoll)  ◀── timerfd 10ms
                            ├── RaftCore (pure logic, no I/O)
                            ├── Ledger state machine
                            └── Storage (WAL, metadata, snapshots)
 ```
 
-One goroutine owns all Raft and ledger state; everything else talks to it over channels, so the core needs no locks. The Raft core does no I/O at all, which lets it be tested in a deterministic simulator before any network code exists.
+Each node is a single thread: sockets, the tick timer and client requests are all file descriptors multiplexed by `epoll`, so there are no locks and no data races. The Raft core does no I/O at all, which lets it be tested in a deterministic simulator before any socket code exists.
 
 ## Project layout
 
 ```
-cmd/            ledger-node, ledger-cli, ledger-harness binaries
-internal/raft   pure Raft core          internal/sim       deterministic simulator
-internal/ledger state machine           internal/storage   WAL, metadata, snapshots
-internal/transport TCP + framing        internal/node      node loop, client + admin services
-internal/client CLI client library      internal/harness   cluster control, faults, workload, chaos
-internal/checker Jepsen-style checker   proto/             protobuf definitions
+src/raft      pure Raft core             tests/sim        deterministic simulator
+src/ledger    state machine              src/storage      WAL, metadata, snapshots
+src/net       epoll loop, TCP, framing   src/node         event loop body, client + admin services
+src/client    CLI client library         src/apps         ledger-node, ledger-cli, ledger-bench
+harness/      Python: cluster control, faults, checker, chaos, demos, plots
+proto/        protobuf definitions       config/          cluster + genesis files
 ```
 
 ## Quickstart *(planned)*
 
 ```bash
-make build                                  # builds bin/ledger-node, bin/ledger-cli, bin/ledger-harness
-./bin/ledger-harness cluster up             # start 5 nodes on localhost
-./bin/ledger-cli create_account alice
-./bin/ledger-cli fund alice 100
-./bin/ledger-cli create_account bob
-./bin/ledger-cli transfer alice bob 30
-./bin/ledger-cli status -all                # roles, terms, commit index, state hash per node
-./bin/ledger-harness demo leader-failure    # kill the leader under load
+sudo apt install build-essential cmake ninja-build protobuf-compiler libprotobuf-dev \
+                 libsodium-dev nlohmann-json3-dev libgtest-dev python3-matplotlib python3-protobuf
+make build                                  # builds build/release/{ledger-node,ledger-cli,ledger-bench}
+make cluster-up                             # start 5 nodes on localhost
+./build/release/ledger-cli create_account alice
+./build/release/ledger-cli fund alice 100
+./build/release/ledger-cli create_account bob
+./build/release/ledger-cli transfer alice bob 30
+./build/release/ledger-cli status --all     # roles, terms, commit index, state hash per node
+python3 -m harness demo leader-failure      # kill the leader under load
 ```
 
 ## Demos *(planned)*
@@ -72,11 +74,11 @@ make build                                  # builds bin/ledger-node, bin/ledger
 
 ## Results *(planned)*
 
-Commit latency (p50/p95/p99) vs load, effect of batching and fsync policy, failover time, and recovery time with vs without snapshots.
+Commit latency (p50/p95/p99) vs load, effect of batching and fsync policy, failover time, cluster size (3 vs 5), and recovery time with vs without snapshots.
 
 ## Team
 
 - Divyanshu Jain (2025201059)
 - Nikhil Patidar (2025201081)
 
-The full design and week-by-week plan are in [`project_details.md`](project_details.md).
+The full design and phase-by-phase plan are in [`project_details.md`](project_details.md).
